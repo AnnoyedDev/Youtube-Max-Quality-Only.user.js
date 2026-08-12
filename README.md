@@ -1,2 +1,5 @@
-# Youtube-Max-Quality-Only.user.js
-Set and lock to the max resolution avaible for you in YouTube (and remove other)
+1) Install TamperMonkey or ViolentMonkey.
+2) Select youtube-max-quality-only.user.js
+3) Click "Raw"
+4) Install
+5) Done.
