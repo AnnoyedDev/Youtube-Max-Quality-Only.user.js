@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube - Max quality only
 // @namespace    https://www.youtube.com/
-// @version      1.0
+// @version      2.0
 // @author       AnnoyedDev
 // @description  Set and lock to the highest avaible quality avaible on the current video played on YouTube and remove lower quality from the menu.
 // @match        https://www.youtube.com/*
@@ -124,3 +124,4 @@
 
   menuObserver.observe(document.documentElement, { childList: true, subtree: true });
 })();
+
