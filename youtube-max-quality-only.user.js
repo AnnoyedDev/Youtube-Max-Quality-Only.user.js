@@ -12,116 +12,42 @@
 (function () {
   'use strict';
 
-  const RECHECK_WINDOW_MS = 15000;
-  const RECHECK_INTERVAL_MS = 1000;
+  const isVideo = (f) => f.mimeType?.startsWith('video/');
+  const playable = (f) => !window.MediaSource || MediaSource.isTypeSupported(f.mimeType);
 
-
-  function getPlayer() {
-    const p = document.getElementById('movie_player');
-    return p && typeof p.getAvailableQualityLevels === 'function' ? p : null;
-  }
-
-  function getBestQualityLevel(player) {
-    try {
-      const levels = player.getAvailableQualityLevels();
-      return levels && levels.length ? levels[0] : null;
-    } catch (e) {
-      return null;
-    }
-  }
-
-  function lockToBestQuality(player) {
-    const best = getBestQualityLevel(player);
-    if (!best) return null;
-    try {
-      player.setPlaybackQualityRange(best, best);
-    } catch (e) {}
-    try {
-      player.setPlaybackQuality(best);
-    } catch (e) {}
-    return best;
-  }
-
-  function ensureQualityChangeListener(player) {
-    if (player.__qualityLockPatched) return;
-    player.__qualityLockPatched = true;
-    try {
-      player.addEventListener('onPlaybackQualityChange', () => {
-        lockToBestQuality(player);
-      });
-    } catch (e) {}
-  }
-
-  function watchQualityForCurrentVideo() {
-    const player = getPlayer();
-    if (!player) return;
-
-    ensureQualityChangeListener(player);
-    let currentBest = lockToBestQuality(player);
-
-    const start = Date.now();
-    const interval = setInterval(() => {
-      if (Date.now() - start > RECHECK_WINDOW_MS) {
-        clearInterval(interval);
-        return;
-      }
-      const best = getBestQualityLevel(player);
-      if (best && best !== currentBest) {
-        currentBest = lockToBestQuality(player);
-      }
-    }, RECHECK_INTERVAL_MS);
-  }
-
-  document.addEventListener('yt-navigate-finish', () => {
-    setTimeout(watchQualityForCurrentVideo, 300);
-  });
-
-  setTimeout(watchQualityForCurrentVideo, 300);
-
-
-  function isQualityLikeLabel(text) {
-    const t = text.trim();
-    return /^\d{3,4}p/i.test(t) || /^auto/i.test(t);
-  }
-
-  function pruneQualityPanel(panel) {
-    const items = Array.from(panel.querySelectorAll('.ytp-menuitem'));
-    if (items.length < 2) return;
-
-    const labels = items.map(
-      (item) => item.querySelector('.ytp-menuitem-label')?.textContent || ''
+  function keepBestOnly(resp) {
+    const sd = resp?.streamingData;
+    if (!Array.isArray(sd?.adaptiveFormats)) return;
+    const videos = sd.adaptiveFormats.filter((f) => isVideo(f) && playable(f));
+    if (!videos.length) return;
+    const max = Math.max(...videos.map((f) => f.width * f.height));
+    sd.adaptiveFormats = sd.adaptiveFormats.filter(
+      (f) => !isVideo(f) || (f.width * f.height === max && playable(f))
     );
-    const qualityLikeCount = labels.filter(isQualityLikeLabel).length;
-    if (qualityLikeCount < items.length - 1) return;
-
-    let kept = false;
-    items.forEach((item, i) => {
-      const label = labels[i].trim();
-      if (/^auto/i.test(label)) {
-        item.remove();
-        return;
-      }
-      if (!kept) {
-        kept = true;
-        return;
-      }
-      item.remove();
-    });
   }
 
-  function scanForQualityPanels(root) {
-    if (root.matches?.('.ytp-panel-menu')) pruneQualityPanel(root);
-    root.querySelectorAll?.('.ytp-panel-menu').forEach(pruneQualityPanel);
-  }
-
-  const menuObserver = new MutationObserver((mutations) => {
-    for (const mutation of mutations) {
-      mutation.addedNodes.forEach((node) => {
-        if (node instanceof HTMLElement) scanForQualityPanels(node);
-      });
+  function patch(obj) {
+    if (obj && typeof obj === 'object') {
+      keepBestOnly(obj);
+      keepBestOnly(obj.playerResponse);
     }
+    return obj;
+  }
+
+  let initial;
+  Object.defineProperty(window, 'ytInitialPlayerResponse', {
+    configurable: true,
+    get: () => initial,
+    set: (v) => { initial = patch(v); },
   });
 
-  menuObserver.observe(document.documentElement, { childList: true, subtree: true });
-})();
+  const origParse = JSON.parse;
+  JSON.parse = function (...args) {
+    return patch(origParse.apply(this, args));
+  };
 
+  const origJson = Response.prototype.json;
+  Response.prototype.json = function () {
+    return origJson.call(this).then(patch);
+  };
+})();
