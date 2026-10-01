@@ -5,7 +5,7 @@
 // @author       AnnoyedDev
 // @description  Set and lock to the highest avaible quality avaible on the current video played on YouTube and remove lower quality from the menu.
 // @match        https://www.youtube.com/*
-// @run-at       document-idle
+// @run-at       document-start
 // @grant        none
 // @updateURL    https://github.com/AnnoyedDev/Youtube-Max-Quality-Only.user.js/raw/refs/heads/main/youtube-max-quality-only.user.js
 // @downloadURL  https://github.com/AnnoyedDev/Youtube-Max-Quality-Only.user.js/raw/refs/heads/main/youtube-max-quality-only.user.js
