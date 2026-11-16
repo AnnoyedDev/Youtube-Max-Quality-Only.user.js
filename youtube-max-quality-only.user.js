@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube - Max quality only
 // @namespace    https://www.youtube.com/
-// @version      2.5
+// @version      2.6
 // @author       AnnoyedDev
 // @description  Set and lock the highest available quality on the current YouTube video and remove the lower qualities from the menu.
 // @match        https://www.youtube.com/*
@@ -20,9 +20,8 @@
     debug: false,
   };
 
-  const PLAYERS = '#movie_player, #shorts-player';
-  const POLL_MS = 50;
-  const POLL_MAX_MS = 8000;
+  const PLAYER_IDS = ['movie_player', 'shorts-player'];
+  const RETRY_MS = 1000;
   const HEIGHTS = {
     highres: 4320,
     hd2880: 2880,
@@ -48,93 +47,73 @@
     }));
   } catch (e) {}
 
-  function availableLevels(p) {
-    let levels = [];
-    try {
-      const data = p.getAvailableQualityData?.();
-      if (Array.isArray(data) && data.length) {
-        levels = data.filter((d) => d && d.isPlayable !== false).map((d) => d.quality);
-      }
-    } catch (e) {}
-    if (!levels.length) {
-      try { levels = p.getAvailableQualityLevels?.() || []; } catch (e) {}
-    }
-    const seen = new Set();
-    return levels
-      .filter((l) => l && l !== 'auto' && HEIGHTS[l] && !seen.has(l) && seen.add(l))
+  function bestLevel(p) {
+    let levels;
+    try { levels = p.getAvailableQualityLevels(); } catch (e) { return null; }
+    if (!Array.isArray(levels)) return null;
+    const real = levels
+      .filter((l) => HEIGHTS[l])
       .sort((a, b) => HEIGHTS[b] - HEIGHTS[a]);
-  }
-
-  function pickBest(levels) {
+    if (!real.length) return null;
     if (CONFIG.maxQuality > 0) {
-      return levels.find((l) => HEIGHTS[l] <= CONFIG.maxQuality) || levels[levels.length - 1];
+      return real.find((l) => HEIGHTS[l] <= CONFIG.maxQuality) || real[real.length - 1];
     }
-    return levels[0];
+    return real[0];
   }
 
-  const applied = new WeakMap();
+  const hooked = new WeakSet();
+  const lastCall = new WeakMap();
 
   function lockPlayer(p) {
-    if (typeof p?.setPlaybackQualityRange !== 'function') return false;
+    if (p.classList.contains('ad-showing')) return;
 
-    const levels = availableLevels(p);
-    if (!levels.length) return false;
+    const best = bestLevel(p);
+    if (!best) return;
 
-    const best = pickBest(levels);
+    let preferred;
+    try { preferred = p.getPreferredQuality?.(); } catch (e) {}
+    if (preferred === best) return;
+
     let videoId = '';
     try { videoId = p.getVideoData?.()?.video_id || ''; } catch (e) {}
     const key = videoId + '|' + best;
-
-    if (applied.get(p) === key) {
-      let preferred;
-      try { preferred = p.getPreferredQuality?.(); } catch (e) {}
-      if (preferred === undefined || preferred === best) return true;
+    const prev = lastCall.get(p);
+    const now = Date.now();
+    if (prev && prev.key === key) {
+      if (preferred === undefined) return;
+      if (now - prev.time < RETRY_MS) return;
     }
-    applied.set(p, key);
+    lastCall.set(p, { key, time: now });
 
     try {
       p.setPlaybackQualityRange(best, best);
-      log('locked', videoId, 'on', best, 'among', levels.join(','));
+      log('locked', videoId, 'on', best);
     } catch (e) {
       log('lock failed', e);
     }
-    return true;
   }
 
-  function lockAll() {
-    const players = document.querySelectorAll(PLAYERS);
-    if (!players.length) return false;
-    let done = true;
-    players.forEach((p) => { if (!lockPlayer(p)) done = false; });
-    return done;
-  }
-
-  let pollTimer = null;
-  let pollUntil = 0;
-
-  function trigger() {
-    pollUntil = Date.now() + POLL_MAX_MS;
-    if (lockAll() || pollTimer !== null) return;
-    pollTimer = setInterval(() => {
-      if (lockAll() || Date.now() > pollUntil) {
-        clearInterval(pollTimer);
-        pollTimer = null;
+  function hookPlayers() {
+    for (const id of PLAYER_IDS) {
+      const p = document.getElementById(id);
+      if (!p || typeof p.setPlaybackQualityRange !== 'function') continue;
+      if (!hooked.has(p)) {
+        hooked.add(p);
+        const run = () => lockPlayer(p);
+        try {
+          p.addEventListener('onVideoDataChange', run);
+          p.addEventListener('onStateChange', run);
+        } catch (e) {
+          log('hook failed', e);
+        }
+        log('player hooked', id);
       }
-    }, POLL_MS);
+      lockPlayer(p);
+    }
   }
 
-  for (const evt of ['yt-navigate-start', 'yt-navigate-finish', 'yt-page-data-updated', 'yt-player-updated', 'pageshow']) {
-    window.addEventListener(evt, trigger, true);
-  }
-  for (const evt of ['loadstart', 'loadedmetadata', 'canplay', 'playing']) {
-    document.addEventListener(evt, (e) => {
-      if (e.target instanceof HTMLVideoElement) trigger();
-    }, true);
-  }
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', trigger);
-  } else {
-    trigger();
+  for (const evt of ['yt-player-updated', 'yt-navigate-finish', 'yt-page-data-updated', 'pageshow']) {
+    window.addEventListener(evt, hookPlayers, true);
   }
 
   function cleanMenu() {
@@ -161,6 +140,11 @@
 
   let scheduled = false;
   new MutationObserver(() => {
+    if (PLAYER_IDS.some((id) => {
+      const p = document.getElementById(id);
+      return p && !hooked.has(p);
+    })) hookPlayers();
+
     if (scheduled) return;
     scheduled = true;
     requestAnimationFrame(() => {
@@ -168,4 +152,6 @@
       cleanMenu();
     });
   }).observe(document, { childList: true, subtree: true });
+
+  hookPlayers();
 })();
