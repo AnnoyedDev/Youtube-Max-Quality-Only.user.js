@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube - Max quality only
 // @namespace    https://www.youtube.com/
-// @version      2.4
+// @version      2.5
 // @author       AnnoyedDev
 // @description  Set and lock the highest available quality on the current YouTube video and remove the lower qualities from the menu.
 // @match        https://www.youtube.com/*
@@ -16,13 +16,13 @@
   'use strict';
 
   const CONFIG = {
-    filterFormats: true,
     maxQuality: 0,
     debug: false,
   };
 
   const PLAYERS = '#movie_player, #shorts-player';
-  const RETRY_MS = 3000;
+  const POLL_MS = 50;
+  const POLL_MAX_MS = 8000;
   const HEIGHTS = {
     highres: 4320,
     hd2880: 2880,
@@ -38,82 +38,6 @@
 
   const log = (...a) => CONFIG.debug && console.log('[Max quality]', ...a);
 
-  const MS = window.MediaSource || window.ManagedMediaSource;
-  const supportCache = new Map();
-
-  const isVideo = (f) => typeof f?.mimeType === 'string' && f.mimeType.startsWith('video/');
-  const area = (f) => (Number(f.width) || 0) * (Number(f.height) || 0);
-  const label = (f) => parseInt(f.qualityLabel, 10) || Math.min(Number(f.width) || 0, Number(f.height) || 0);
-
-  function playable(f) {
-    if (!MS?.isTypeSupported) return true;
-    let ok = supportCache.get(f.mimeType);
-    if (ok === undefined) {
-      try { ok = MS.isTypeSupported(f.mimeType); } catch { ok = true; }
-      supportCache.set(f.mimeType, ok);
-    }
-    return ok;
-  }
-
-  function keepBestOnly(resp) {
-    const sd = resp?.streamingData;
-    if (!sd || !Array.isArray(sd.adaptiveFormats)) return;
-
-    let videos = sd.adaptiveFormats.filter((f) => isVideo(f) && area(f) > 0 && playable(f));
-    if (!videos.length) return;
-
-    if (CONFIG.maxQuality > 0) {
-      const capped = videos.filter((f) => label(f) <= CONFIG.maxQuality);
-      if (capped.length) videos = capped;
-    }
-
-    const max = Math.max(...videos.map(area));
-    const keep = new Set(videos.filter((f) => area(f) === max));
-    if (!keep.size) return;
-
-    const before = sd.adaptiveFormats.length;
-    sd.adaptiveFormats = sd.adaptiveFormats.filter((f) => !isVideo(f) || keep.has(f));
-    if (before !== sd.adaptiveFormats.length) {
-      log('formats', before, '->', sd.adaptiveFormats.length, [...keep][0]?.qualityLabel);
-    }
-  }
-
-  function patch(obj) {
-    try {
-      if (obj && typeof obj === 'object') {
-        if (obj.streamingData) keepBestOnly(obj);
-        if (obj.playerResponse?.streamingData) keepBestOnly(obj.playerResponse);
-      }
-    } catch (e) {
-      log('patch failed', e);
-    }
-    return obj;
-  }
-
-  if (CONFIG.filterFormats) {
-    try {
-      let initial = patch(window.ytInitialPlayerResponse);
-      Object.defineProperty(window, 'ytInitialPlayerResponse', {
-        configurable: true,
-        enumerable: true,
-        get: () => initial,
-        set: (v) => { initial = patch(v); },
-      });
-    } catch (e) {
-      log('cannot hook ytInitialPlayerResponse', e);
-    }
-
-    const origParse = JSON.parse;
-    JSON.parse = function parse(...args) {
-      return patch(origParse.apply(this, args));
-    };
-
-    const origJson = Response.prototype.json;
-    Response.prototype.json = function json(...args) {
-      return origJson.apply(this, args).then(patch);
-    };
-  }
-
   try {
     const q = CONFIG.maxQuality > 0 ? CONFIG.maxQuality : 4320;
     const now = Date.now();
@@ -124,60 +48,93 @@
     }));
   } catch (e) {}
 
-  function pickBest(real) {
-    if (CONFIG.maxQuality > 0) {
-      const allowed = real.find((l) => (HEIGHTS[l] || 0) <= CONFIG.maxQuality);
-      return allowed || real[real.length - 1];
+  function availableLevels(p) {
+    let levels = [];
+    try {
+      const data = p.getAvailableQualityData?.();
+      if (Array.isArray(data) && data.length) {
+        levels = data.filter((d) => d && d.isPlayable !== false).map((d) => d.quality);
+      }
+    } catch (e) {}
+    if (!levels.length) {
+      try { levels = p.getAvailableQualityLevels?.() || []; } catch (e) {}
     }
-    return real[0];
+    const seen = new Set();
+    return levels
+      .filter((l) => l && l !== 'auto' && HEIGHTS[l] && !seen.has(l) && seen.add(l))
+      .sort((a, b) => HEIGHTS[b] - HEIGHTS[a]);
   }
 
-  const hooked = new WeakSet();
-  const state = new WeakMap();
+  function pickBest(levels) {
+    if (CONFIG.maxQuality > 0) {
+      return levels.find((l) => HEIGHTS[l] <= CONFIG.maxQuality) || levels[levels.length - 1];
+    }
+    return levels[0];
+  }
+
+  const applied = new WeakMap();
 
   function lockPlayer(p) {
-    if (typeof p?.setPlaybackQualityRange !== 'function') return;
+    if (typeof p?.setPlaybackQualityRange !== 'function') return false;
 
-    if (!hooked.has(p)) {
-      hooked.add(p);
-      try {
-        p.addEventListener('onStateChange', lockAll);
-      } catch (e) {}
-    }
+    const levels = availableLevels(p);
+    if (!levels.length) return false;
 
-    let levels;
-    try { levels = p.getAvailableQualityLevels?.(); } catch { return; }
-    if (!Array.isArray(levels)) return;
-    const real = levels.filter((l) => l && l !== 'auto');
-    if (real.length < 2) return;
+    const best = pickBest(levels);
+    let videoId = '';
+    try { videoId = p.getVideoData?.()?.video_id || ''; } catch (e) {}
+    const key = videoId + '|' + best;
 
-    const best = pickBest(real);
-    const key = (p.getVideoData?.()?.video_id || '') + '|' + best;
-    const prev = state.get(p);
-    const now = Date.now();
-
-    if (prev && prev.key === key) {
-      if (now - prev.time < RETRY_MS) return;
+    if (applied.get(p) === key) {
       let preferred;
-      try { preferred = p.getPreferredQuality?.(); } catch {}
-      if (preferred === undefined || preferred === best) return;
+      try { preferred = p.getPreferredQuality?.(); } catch (e) {}
+      if (preferred === undefined || preferred === best) return true;
     }
-    state.set(p, { key, time: now });
+    applied.set(p, key);
 
     try {
       p.setPlaybackQualityRange(best, best);
-      log('fallback lock on', best);
+      log('locked', videoId, 'on', best, 'among', levels.join(','));
     } catch (e) {
       log('lock failed', e);
     }
+    return true;
   }
 
   function lockAll() {
-    document.querySelectorAll(PLAYERS).forEach(lockPlayer);
+    const players = document.querySelectorAll(PLAYERS);
+    if (!players.length) return false;
+    let done = true;
+    players.forEach((p) => { if (!lockPlayer(p)) done = false; });
+    return done;
   }
 
-  for (const evt of ['yt-player-updated', 'yt-navigate-finish', 'yt-page-data-updated']) {
-    document.addEventListener(evt, lockAll);
+  let pollTimer = null;
+  let pollUntil = 0;
+
+  function trigger() {
+    pollUntil = Date.now() + POLL_MAX_MS;
+    if (lockAll() || pollTimer !== null) return;
+    pollTimer = setInterval(() => {
+      if (lockAll() || Date.now() > pollUntil) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+      }
+    }, POLL_MS);
+  }
+
+  for (const evt of ['yt-navigate-start', 'yt-navigate-finish', 'yt-page-data-updated', 'yt-player-updated', 'pageshow']) {
+    window.addEventListener(evt, trigger, true);
+  }
+  for (const evt of ['loadstart', 'loadedmetadata', 'canplay', 'playing']) {
+    document.addEventListener(evt, (e) => {
+      if (e.target instanceof HTMLVideoElement) trigger();
+    }, true);
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', trigger);
+  } else {
+    trigger();
   }
 
   function cleanMenu() {
